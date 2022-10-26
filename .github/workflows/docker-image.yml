@@ -14,10 +14,9 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v3
 
-    - name: Build and Push Web App Docker image to GitHub Container Registry
+    - name: Build and Push Docker image to GitHub Container Registry
       id: build-push-image
       run: |
-        docker build -f Dockerfile . `
-          -t ghcr.io/${{ github.repository }}-web:latest
+        docker build -f Dockerfile . -t ghcr.io/${{ github.repository }}:latest
         docker push ghcr.io/${{ github.repository }}:latest
         echo "::set-output name=image::ghcr.io/${{ github.repository }}:latest"
