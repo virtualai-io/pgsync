@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 class Payload(object):
 
-    __slots__ = ("tg_op", "table", "schema", "old", "new", "xmin")
+    __slots__ = ("tg_op", "table", "schema", "old", "new", "xmin", "indices")
 
     def __init__(
         self,
@@ -61,6 +61,7 @@ class Payload(object):
         old: dict = Optional[None],
         new: dict = Optional[None],
         xmin: int = Optional[None],
+        indices: List[str] = Optional[None],
     ):
         self.tg_op: str = tg_op
         self.table: str = table
@@ -68,6 +69,7 @@ class Payload(object):
         self.old: dict = old or {}
         self.new: dict = new or {}
         self.xmin: str = xmin
+        self.indices: List[str] = indices
 
     @property
     def data(self) -> dict:
@@ -112,6 +114,7 @@ class Base(object):
         self.__views: dict = {}
         self.__materialized_views: dict = {}
         self.__tables: dict = {}
+        self.__columns: dict = {}
         self.verbose: bool = verbose
         self._conn = None
 
@@ -179,7 +182,7 @@ class Base(object):
             model = metadata.tables[name]
             model.append_column(sa.Column("xmin", sa.BigInteger))
             model.append_column(sa.Column("ctid"), TupleIdentifierType)
-            # support SQLQlchemy/Postgres 14 which somehow now reflects
+            # support SQLAlchemy/Postgres 14 which somehow now reflects
             # the oid column
             if "oid" not in [column.name for column in model.columns]:
                 model.append_column(
@@ -249,8 +252,9 @@ class Base(object):
     def indices(self, table: str, schema: str) -> list:
         """Get the database table indexes."""
         if (table, schema) not in self.__indices:
+            indexes = sa.inspect(self.engine).get_indexes(table, schema=schema)
             self.__indices[(table, schema)] = sorted(
-                sa.inspect(self.engine).get_indexes(table, schema=schema)
+                indexes, key=lambda d: d["name"]
             )
         return self.__indices[(table, schema)]
 
@@ -261,6 +265,15 @@ class Base(object):
                 sa.inspect(self.engine).get_table_names(schema)
             )
         return self.__tables[schema]
+
+    def columns(self, schema: str, table: str) -> list:
+        """Get the column names for a table/view."""
+        if (table, schema) not in self.__columns:
+            columns = sa.inspect(self.engine).get_columns(table, schema=schema)
+            self.__columns[(table, schema)] = sorted(
+                [column["name"] for column in columns]
+            )
+        return self.__columns[(table, schema)]
 
     def truncate_table(self, table: str, schema: str = DEFAULT_SCHEMA) -> None:
         """Truncate a table.
@@ -429,7 +442,7 @@ class Base(object):
             limit=limit,
             offset=offset,
         )
-        self.execute(statement)
+        self.execute(statement, options=dict(stream_results=STREAM_RESULTS))
 
     def logical_slot_peek_changes(
         self,
@@ -480,12 +493,17 @@ class Base(object):
 
     # Views...
     def create_view(
-        self, schema: str, tables: Set, user_defined_fkey_tables: dict
+        self,
+        index: str,
+        schema: str,
+        tables: Set,
+        user_defined_fkey_tables: dict,
     ) -> None:
         create_view(
             self.engine,
             self.models,
             self.fetchall,
+            index,
             schema,
             tables,
             user_defined_fkey_tables,
@@ -978,6 +996,23 @@ def drop_database(database: str, echo: bool = False) -> None:
     with pg_engine("postgres", echo=echo) as engine:
         pg_execute(engine, sa.DDL(f'DROP DATABASE IF EXISTS "{database}"'))
     logger.debug(f"Dropped database: {database}")
+
+
+def database_exists(database: str, echo: bool = False) -> bool:
+    """Check if database is present."""
+    with pg_engine("postgres", echo=echo) as engine:
+        conn = engine.connect()
+        try:
+            row = conn.execute(
+                sa.DDL(
+                    f"SELECT 1 FROM pg_database WHERE datname = '{database}'"
+                )
+            ).first()
+            conn.close()
+        except Exception as e:
+            logger.exception(f"Exception {e}")
+            raise
+        return row is not None
 
 
 def create_extension(

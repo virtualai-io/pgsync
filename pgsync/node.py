@@ -25,6 +25,7 @@ from .exc import (
     RelationshipForeignKeyError,
     RelationshipTypeError,
     RelationshipVariantError,
+    SchemaError,
     TableNotInNodeError,
 )
 
@@ -164,7 +165,7 @@ class Node(object):
 
         for column_name in self.column_names:
 
-            tokens = None
+            tokens: Optional[list] = None
             if any(op in column_name for op in JSONB_OPERATORS):
                 tokens = re.split(
                     f"({'|'.join(JSONB_OPERATORS)})",
@@ -275,7 +276,10 @@ class Tree:
         return self.root.traverse_post_order()
 
     def build(self, data: dict) -> Node:
-
+        if not isinstance(data, dict):
+            raise SchemaError(
+                "Incompatible schema. Please run v2 schema migration"
+            )
         table: str = data.get("table")
         schema: str = data.get("schema", DEFAULT_SCHEMA)
         key: Tuple[str, str] = (schema, table)

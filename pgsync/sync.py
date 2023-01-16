@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """Sync module."""
 import asyncio
 import json
@@ -19,21 +17,23 @@ import sqlparse
 from psycopg2 import OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-from . import __version__
+from . import __version__, settings
 from .base import Base, Payload
 from .constants import (
     DELETE,
     INSERT,
+    MATERIALIZED_VIEW,
+    MATERIALIZED_VIEW_COLUMNS,
     META,
     PRIMARY_KEY_DELIMITER,
     TG_OP,
     TRUNCATE,
     UPDATE,
 )
-from .elastichelper import ElasticHelper
 from .exc import (
     ForeignKeyError,
     InvalidSchemaError,
+    InvalidTGOPError,
     PrimaryKeyNotFoundError,
     RDSError,
     SchemaError,
@@ -42,24 +42,16 @@ from .node import Node, Tree
 from .plugin import Plugins
 from .querybuilder import QueryBuilder
 from .redisqueue import RedisQueue
-from .settings import (
-    CHECKPOINT_PATH,
-    JOIN_QUERIES,
-    LOG_INTERVAL,
-    LOGICAL_SLOT_CHUNK_SIZE,
-    NTHREADS_POLLDB,
-    POLL_TIMEOUT,
-    REDIS_POLL_INTERVAL,
-    REDIS_WRITE_CHUNK_SIZE,
-    REPLICATION_SLOT_CLEANUP_INTERVAL,
-    USE_ASYNC,
-)
+from .search_client import SearchClient
+from .singleton import Singleton
 from .transform import Transform
 from .utils import (
+    chunks,
     compiled_query,
+    config_loader,
     exception,
     get_config,
-    load_config,
+    MutuallyExclusiveOption,
     show_settings,
     threaded,
     Timer,
@@ -68,7 +60,7 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-class Sync(Base):
+class Sync(Base, metaclass=Singleton):
     """Main application class for Sync."""
 
     def __init__(
@@ -90,7 +82,7 @@ class Sync(Base):
         super().__init__(
             document.get("database", self.index), verbose=verbose, **kwargs
         )
-        self.es: ElasticHelper = ElasticHelper()
+        self.search_client: SearchClient = SearchClient()
         self.__name: str = re.sub(
             "[^0-9a-zA-Z_]+", "", f"{self.database.lower()}_{self.index}"
         )
@@ -98,13 +90,16 @@ class Sync(Base):
         self._plugins: Plugins = None
         self._truncate: bool = False
         self._checkpoint_file: str = os.path.join(
-            CHECKPOINT_PATH, f".{self.__name}"
+            settings.CHECKPOINT_PATH, f".{self.__name}"
         )
         self.redis: RedisQueue = RedisQueue(self.__name)
         self.tree: Tree = Tree(self.models)
+        self.tree.build(self.nodes)
         if validate:
             self.validate(repl_slots=repl_slots)
             self.create_setting()
+        if self.plugins:
+            self._plugins: Plugins = Plugins("plugins", self.plugins)
         self.query_builder: QueryBuilder = QueryBuilder(verbose=verbose)
         self.count: dict = dict(xlog=0, db=0, redis=0)
 
@@ -118,9 +113,6 @@ class Sync(Base):
             )
 
         self.connect()
-
-        if self.plugins:
-            self._plugins: Plugins = Plugins("plugins", self.plugins)
 
         max_replication_slots: Optional[str] = self.pg_settings(
             "max_replication_slots"
@@ -162,22 +154,31 @@ class Sync(Base):
             )
 
         # ensure the checkpoint dirpath is valid
-        if not os.path.exists(CHECKPOINT_PATH):
+        if not os.path.exists(settings.CHECKPOINT_PATH):
             raise RuntimeError(
-                f'Ensure the checkpoint directory exists "{CHECKPOINT_PATH}" '
-                f"and is readable."
+                f"Ensure the checkpoint directory exists "
+                f'"{settings.CHECKPOINT_PATH}" and is readable.'
             )
 
-        if not os.access(CHECKPOINT_PATH, os.W_OK | os.R_OK):
+        if not os.access(settings.CHECKPOINT_PATH, os.W_OK | os.R_OK):
             raise RuntimeError(
-                f'Ensure the checkpoint directory "{CHECKPOINT_PATH}" is '
-                f"read/writable"
+                f'Ensure the checkpoint directory "{settings.CHECKPOINT_PATH}"'
+                f" is read/writable"
             )
 
-        self.tree.build(self.nodes)
         self.tree.display()
 
         for node in self.tree.traverse_breadth_first():
+
+            # ensure internal materialized view compatibility
+            if MATERIALIZED_VIEW in self._materialized_views(node.schema):
+                if MATERIALIZED_VIEW_COLUMNS != self.columns(
+                    node.schema, MATERIALIZED_VIEW
+                ):
+                    raise RuntimeError(
+                        f"Required materialized view columns not present on "
+                        f"{MATERIALIZED_VIEW}. Please re-run bootstrap."
+                    )
 
             if node.schema not in self.schemas:
                 raise InvalidSchemaError(
@@ -244,8 +245,8 @@ class Sync(Base):
                 sys.stdout.flush()
 
     def create_setting(self) -> None:
-        """Create Elasticsearch setting and mapping if required."""
-        self.es._create_setting(
+        """Create Elasticsearch/OpenSearch setting and mapping if required."""
+        self.search_client._create_setting(
             self.index,
             self.tree,
             setting=self.setting,
@@ -256,7 +257,7 @@ class Sync(Base):
     def setup(self) -> None:
         """Create the database triggers and replication slot."""
 
-        join_queries: bool = JOIN_QUERIES
+        join_queries: bool = settings.JOIN_QUERIES
         self.teardown(drop_view=False)
 
         for schema in self.schemas:
@@ -288,7 +289,9 @@ class Sync(Base):
                     user_defined_fkey_tables.setdefault(node.table, set())
                     user_defined_fkey_tables[node.table] |= set(columns)
             if tables:
-                self.create_view(schema, tables, user_defined_fkey_tables)
+                self.create_view(
+                    self.index, schema, tables, user_defined_fkey_tables
+                )
                 self.create_triggers(
                     schema, tables=tables, join_queries=join_queries
                 )
@@ -297,7 +300,7 @@ class Sync(Base):
     def teardown(self, drop_view: bool = True) -> None:
         """Drop the database triggers and replication slot."""
 
-        join_queries: bool = JOIN_QUERIES
+        join_queries: bool = settings.JOIN_QUERIES
 
         try:
             os.unlink(self._checkpoint_file)
@@ -327,7 +330,9 @@ class Sync(Base):
         self.drop_replication_slot(self.__name)
 
     def get_doc_id(self, primary_keys: List[str], table: str) -> str:
-        """Get the Elasticsearch document id from the primary keys."""
+        """
+        Get the Elasticsearch/OpenSearch document id from the primary keys.
+        """  # noqa D200
         if not primary_keys:
             raise PrimaryKeyNotFoundError(
                 f"No primary key found on table: {table}"
@@ -368,7 +373,7 @@ class Sync(Base):
         # by limiting to a smaller batch size.
         offset: int = 0
         total: int = 0
-        limit: int = LOGICAL_SLOT_CHUNK_SIZE
+        limit: int = settings.LOGICAL_SLOT_CHUNK_SIZE
         count: int = self.logical_slot_count_changes(
             self.__name,
             txmin=txmin,
@@ -425,10 +430,14 @@ class Sync(Base):
                         payload.tg_op != payload2.tg_op
                         or payload.table != payload2.table
                     ):
-                        self.es.bulk(self.index, self._payloads(payloads))
+                        self.search_client.bulk(
+                            self.index, self._payloads(payloads)
+                        )
                         payloads: list = []
                 elif j == len(rows):
-                    self.es.bulk(self.index, self._payloads(payloads))
+                    self.search_client.bulk(
+                        self.index, self._payloads(payloads)
+                    )
                     payloads: list = []
             self.logical_slot_get_changes(
                 self.__name,
@@ -441,6 +450,67 @@ class Sync(Base):
             offset += limit
             total += len(changes)
             self.count["xlog"] += len(rows)
+
+    def _root_primary_key_resolver(
+        self, node: Node, payload: Payload, filters: list
+    ) -> list:
+        fields: dict = defaultdict(list)
+        primary_values: list = [
+            payload.data[key] for key in node.model.primary_keys
+        ]
+        primary_fields: dict = dict(
+            zip(node.model.primary_keys, primary_values)
+        )
+        for key, value in primary_fields.items():
+            fields[key].append(value)
+        for doc_id in self.search_client._search(
+            self.index, node.table, fields
+        ):
+            where: dict = {}
+            params: dict = doc_id.split(PRIMARY_KEY_DELIMITER)
+            for i, key in enumerate(self.tree.root.model.primary_keys):
+                where[key] = params[i]
+            filters.append(where)
+
+        return filters
+
+    def _root_foreign_key_resolver(
+        self, node: Node, payload: Payload, foreign_keys: dict, filters: list
+    ) -> list:
+        """
+        Foreign key resolver logic:
+
+        This resolver handles n-tiers relationships (n > 3) where we
+        insert/update a new row to a leaf node.
+        For the node's parent, get the primary keys values from the
+        incoming payload.
+        Lookup this value in the meta section of Elasticsearch/OpenSearch
+        Then get the root node returned and re-sync that root record.
+        Essentially, we want to lookup the root node affected by
+        our insert/update operation and sync the tree branch for that root.
+        """
+        fields: dict = defaultdict(list)
+        foreign_values: list = [
+            payload.new.get(k) for k in foreign_keys[node.name]
+        ]
+        for key in [key.name for key in node.primary_keys]:
+            for value in foreign_values:
+                if value:
+                    fields[key].append(value)
+        # TODO: we should combine this with the filter above
+        # so we only hit Elasticsearch/OpenSearch once
+        for doc_id in self.search_client._search(
+            self.index,
+            node.parent.table,
+            fields,
+        ):
+            where: dict = {}
+            params: dict = doc_id.split(PRIMARY_KEY_DELIMITER)
+            for i, key in enumerate(self.tree.root.model.primary_keys):
+                where[key] = params[i]
+            filters.append(where)
+
+        return filters
 
     def _insert_op(
         self, node: Node, filters: dict, payloads: List[Payload]
@@ -471,12 +541,12 @@ class Sync(Base):
                     raise
 
                 # set the parent as the new entity that has changed
-                filters[node.parent.table] = []
                 foreign_keys = self.query_builder._get_foreign_keys(
                     node.parent,
                     node,
                 )
 
+                _filters: list = []
                 for payload in payloads:
                     for i, key in enumerate(foreign_keys[node.name]):
                         if key == foreign_keys[node.parent.name][i]:
@@ -488,11 +558,17 @@ class Sync(Base):
                                 }
                             )
 
+                    _filters = self._root_foreign_key_resolver(
+                        node, payload, foreign_keys, _filters
+                    )
+
+                if _filters:
+                    filters[self.tree.root.table].extend(_filters)
+
         else:
 
             # handle case where we insert into a through table
             # set the parent as the new entity that has changed
-            filters[node.parent.table] = []
             foreign_keys = self.query_builder.get_foreign_keys(
                 node.parent,
                 node,
@@ -511,17 +587,16 @@ class Sync(Base):
         node: Node,
         filters: dict,
         payloads: List[dict],
-        extra: dict,
     ) -> dict:
 
         if node.is_root:
 
             # Here, we are performing two operations:
             # 1) Build a filter to sync the updated record(s)
-            # 2) Delete the old record(s) in Elasticsearch if the
+            # 2) Delete the old record(s) in Elasticsearch/OpenSearch if the
             #    primary key has changed
-            #   2.1) This is crucial otherwise we can have the old
-            #        and new document in Elasticsearch at the same time
+            #   2.1) This is crucial otherwise we can have the old and new
+            #        document in Elasticsearch/OpenSearch at the same time
             docs: list = []
             for payload in payloads:
                 primary_values: list = [
@@ -557,48 +632,26 @@ class Sync(Base):
                     }
                     if self.routing:
                         doc["_routing"] = old_values[self.routing]
-                    if self.es.major_version < 7 and not self.es.is_opensearch:
+                    if (
+                        self.search_client.major_version < 7
+                        and not self.search_client.is_opensearch
+                    ):
                         doc["_type"] = "_doc"
                     docs.append(doc)
 
             if docs:
-                self.es.bulk(self.index, docs)
+                self.search_client.bulk(self.index, docs)
 
         else:
 
             # update the child tables
             for payload in payloads:
                 _filters: list = []
-                fields: dict = defaultdict(list)
-
-                primary_values: list = [
-                    payload.data[key] for key in node.model.primary_keys
-                ]
-                primary_fields: dict = dict(
-                    zip(node.model.primary_keys, primary_values)
+                _filters = self._root_primary_key_resolver(
+                    node, payload, _filters
                 )
-
-                for key, value in primary_fields.items():
-                    fields[key].append(value)
-                    if None in payload.new.values():
-                        extra["table"] = node.table
-                        extra["column"] = key
-
-                if None in payload.old.values():
-                    for key, value in primary_fields.items():
-                        fields[key].append(0)
-
-                for doc_id in self.es._search(self.index, node.table, fields):
-                    where = {}
-                    params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                    for i, key in enumerate(self.tree.root.model.primary_keys):
-                        where[key] = params[i]
-                    _filters.append(where)
-
                 # also handle foreign_keys
                 if node.parent:
-                    fields = defaultdict(list)
-
                     try:
                         foreign_keys = self.query_builder.get_foreign_keys(
                             node.parent,
@@ -610,28 +663,9 @@ class Sync(Base):
                             node,
                         )
 
-                    foreign_values = [
-                        payload.new.get(k) for k in foreign_keys[node.name]
-                    ]
-
-                    for key in [key.name for key in node.primary_keys]:
-                        for value in foreign_values:
-                            if value:
-                                fields[key].append(value)
-                    # TODO: we should combine this with the filter above
-                    # so we only hit Elasticsearch once
-                    for doc_id in self.es._search(
-                        self.index,
-                        node.parent.table,
-                        fields,
-                    ):
-                        where: dict = {}
-                        params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                        for i, key in enumerate(
-                            self.tree.root.model.primary_keys
-                        ):
-                            where[key] = params[i]
-                        _filters.append(where)
+                    _filters = self._root_foreign_key_resolver(
+                        node, payload, foreign_keys, _filters
+                    )
 
                 if _filters:
                     filters[self.tree.root.table].extend(_filters)
@@ -642,7 +676,8 @@ class Sync(Base):
         self, node: Node, filters: dict, payloads: List[dict]
     ) -> dict:
 
-        # when deleting a root node, just delete the doc in Elasticsearch
+        # when deleting a root node, just delete the doc in
+        # Elasticsearch/OpenSearch
         if node.is_root:
 
             docs: list = []
@@ -660,15 +695,20 @@ class Sync(Base):
                 }
                 if self.routing:
                     doc["_routing"] = payload.data[self.routing]
-                if self.es.major_version < 7 and not self.es.is_opensearch:
+                if (
+                    self.search_client.major_version < 7
+                    and not self.search_client.is_opensearch
+                ):
                     doc["_type"] = "_doc"
                 docs.append(doc)
             if docs:
                 raise_on_exception: Optional[bool] = (
-                    False if USE_ASYNC else None
+                    False if settings.USE_ASYNC else None
                 )
-                raise_on_error: Optional[bool] = False if USE_ASYNC else None
-                self.es.bulk(
+                raise_on_error: Optional[bool] = (
+                    False if settings.USE_ASYNC else None
+                )
+                self.search_client.bulk(
                     self.index,
                     docs,
                     raise_on_exception=raise_on_exception,
@@ -681,26 +721,10 @@ class Sync(Base):
             # the child keys match in private, then get the root doc_id and
             # re-sync the child tables
             for payload in payloads:
-                primary_values: list = [
-                    payload.data[key] for key in node.model.primary_keys
-                ]
-                primary_fields = dict(
-                    zip(node.model.primary_keys, primary_values)
-                )
-                fields = defaultdict(list)
-
                 _filters: list = []
-                for key, value in primary_fields.items():
-                    fields[key].append(value)
-
-                for doc_id in self.es._search(self.index, node.table, fields):
-                    where = {}
-                    params = doc_id.split(PRIMARY_KEY_DELIMITER)
-                    for i, key in enumerate(self.tree.root.model.primary_keys):
-                        where[key] = params[i]
-
-                    _filters.append(where)
-
+                _filters = self._root_primary_key_resolver(
+                    node, payload, _filters
+                )
                 if _filters:
                     filters[self.tree.root.table].extend(_filters)
 
@@ -711,22 +735,25 @@ class Sync(Base):
         if node.is_root:
 
             docs: list = []
-            for doc_id in self.es._search(self.index, node.table):
+            for doc_id in self.search_client._search(self.index, node.table):
                 doc: dict = {
                     "_id": doc_id,
                     "_index": self.index,
                     "_op_type": "delete",
                 }
-                if self.es.major_version < 7 and not self.es.is_opensearch:
+                if (
+                    self.search_client.major_version < 7
+                    and not self.search_client.is_opensearch
+                ):
                     doc["_type"] = "_doc"
                 docs.append(doc)
             if docs:
-                self.es.bulk(self.index, docs)
+                self.search_client.bulk(self.index, docs)
 
         else:
 
             _filters: list = []
-            for doc_id in self.es._search(self.index, node.table):
+            for doc_id in self.search_client._search(self.index, node.table):
                 where: dict = {}
                 params = doc_id.split(PRIMARY_KEY_DELIMITER)
                 for i, key in enumerate(self.tree.root.model.primary_keys):
@@ -771,7 +798,7 @@ class Sync(Base):
         payload: Payload = payloads[0]
         if payload.tg_op not in TG_OP:
             logger.exception(f"Unknown tg_op {payload.tg_op}")
-            raise
+            raise InvalidTGOPError(f"Unknown tg_op {payload.tg_op}")
 
         # we might receive an event triggered for a table
         # that is not in the tree node.
@@ -798,8 +825,12 @@ class Sync(Base):
 
         logger.debug(f"tg_op: {payload.tg_op} table: {node.name}")
 
-        filters: dict = {node.table: [], self.tree.root.table: []}
-        extra: dict = {}
+        filters: dict = {
+            node.table: [],
+            self.tree.root.table: [],
+        }
+        if not node.is_root:
+            filters[node.parent.table] = []
 
         if payload.tg_op == INSERT:
 
@@ -810,12 +841,10 @@ class Sync(Base):
             )
 
         if payload.tg_op == UPDATE:
-
             filters = self._update_op(
                 node,
                 filters,
                 payloads,
-                extra,
             )
 
         if payload.tg_op == DELETE:
@@ -834,14 +863,62 @@ class Sync(Base):
         # otherwise we would end up performing a full query
         # and sync the entire db!
         if any(filters.values()):
-            yield from self.sync(filters=filters, extra=extra)
+            """
+            Filters are applied when an insert, update or delete operation
+            occurs. For a large table update, this normally results
+            in a large SQL query with multiple OR clauses.
+
+            Filters is a dict of tables where each key is a list of id's
+            {
+                'city': [
+                    {'id': '1'},
+                    {'id': '4'},
+                    {'id': '5'},
+                ],
+                'book': [
+                    {'id': '1'},
+                    {'id': '2'},
+                    {'id': '7'},
+                    ...
+                ]
+            }
+            """
+            for l1 in chunks(
+                filters.get(self.tree.root.table), settings.FILTER_CHUNK_SIZE
+            ):
+                if filters.get(node.table):
+                    for l2 in chunks(
+                        filters.get(node.table), settings.FILTER_CHUNK_SIZE
+                    ):
+                        if not node.is_root and filters.get(node.parent.table):
+                            for l3 in chunks(
+                                filters.get(node.parent.table),
+                                settings.FILTER_CHUNK_SIZE,
+                            ):
+                                yield from self.sync(
+                                    filters={
+                                        self.tree.root.table: l1,
+                                        node.table: l2,
+                                        node.parent.table: l3,
+                                    },
+                                )
+                        else:
+                            yield from self.sync(
+                                filters={
+                                    self.tree.root.table: l1,
+                                    node.table: l2,
+                                },
+                            )
+                else:
+                    yield from self.sync(
+                        filters={self.tree.root.table: l1},
+                    )
 
     def sync(
         self,
         filters: Optional[dict] = None,
         txmin: Optional[int] = None,
         txmax: Optional[int] = None,
-        extra: Optional[dict] = None,
         ctid: Optional[dict] = None,
     ) -> Generator:
         self.query_builder.isouter = True
@@ -883,12 +960,6 @@ class Sync(Base):
                 row: dict = Transform.transform(row, self.nodes)
 
                 row[META] = Transform.get_primary_keys(keys)
-                if extra:
-                    if extra["table"] not in row[META]:
-                        row[META][extra["table"]] = {}
-                    if extra["column"] not in row[META][extra["table"]]:
-                        row[META][extra["table"]][extra["column"]] = []
-                    row[META][extra["table"]][extra["column"]].append(0)
 
                 if self.verbose:
                     print(f"{(i+1)})")
@@ -905,7 +976,10 @@ class Sync(Base):
                 if self.routing:
                     doc["_routing"] = row[self.routing]
 
-                if self.es.major_version < 7 and not self.es.is_opensearch:
+                if (
+                    self.search_client.major_version < 7
+                    and not self.search_client.is_opensearch
+                ):
                     doc["_type"] = "_doc"
 
                 if self._plugins:
@@ -935,7 +1009,7 @@ class Sync(Base):
         self._checkpoint: int = value
 
     def _poll_redis(self) -> None:
-        payloads: dict = self.redis.bulk_pop()
+        payloads: list = self.redis.bulk_pop()
         if payloads:
             logger.debug(f"poll_redis: {payloads}")
             self.count["redis"] += len(payloads)
@@ -943,7 +1017,7 @@ class Sync(Base):
             self.on_publish(
                 list(map(lambda payload: Payload(**payload), payloads))
             )
-        time.sleep(REDIS_POLL_INTERVAL)
+        time.sleep(settings.REDIS_POLL_INTERVAL)
 
     @threaded
     @exception
@@ -953,7 +1027,7 @@ class Sync(Base):
             self._poll_redis()
 
     async def _async_poll_redis(self) -> None:
-        payloads: dict = self.redis.bulk_pop()
+        payloads: list = self.redis.bulk_pop()
         if payloads:
             logger.debug(f"poll_redis: {payloads}")
             self.count["redis"] += len(payloads)
@@ -961,7 +1035,7 @@ class Sync(Base):
             await self.async_on_publish(
                 list(map(lambda payload: Payload(**payload), payloads))
             )
-        await asyncio.sleep(REDIS_POLL_INTERVAL)
+        await asyncio.sleep(settings.REDIS_POLL_INTERVAL)
 
     @exception
     async def async_poll_redis(self) -> None:
@@ -987,8 +1061,12 @@ class Sync(Base):
         payloads: list = []
 
         while True:
-            # NB: consider reducing POLL_TIMEOUT to increase throughout
-            if select.select([conn], [], [], POLL_TIMEOUT) == ([], [], []):
+            # NB: consider reducing POLL_TIMEOUT to increase throughput
+            if select.select([conn], [], [], settings.POLL_TIMEOUT) == (
+                [],
+                [],
+                [],
+            ):
                 # Catch any hanging items from the last poll
                 if payloads:
                     self.redis.bulk_push(payloads)
@@ -1002,15 +1080,16 @@ class Sync(Base):
                 os._exit(-1)
 
             while conn.notifies:
-                if len(payloads) >= REDIS_WRITE_CHUNK_SIZE:
+                if len(payloads) >= settings.REDIS_WRITE_CHUNK_SIZE:
                     self.redis.bulk_push(payloads)
                     payloads = []
                 notification: AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
                     payload = json.loads(notification.payload)
-                    payloads.append(payload)
-                    logger.debug(f"on_notify: {payload}")
-                    self.count["db"] += 1
+                    if self.index in payload["indices"]:
+                        payloads.append(payload)
+                        logger.debug(f"on_notify: {payload}")
+                        self.count["db"] += 1
 
     @exception
     def async_poll_db(self) -> None:
@@ -1029,9 +1108,10 @@ class Sync(Base):
             notification: AnyStr = self.conn.notifies.pop(0)
             if notification.channel == self.database:
                 payload = json.loads(notification.payload)
-                self.redis.bulk_push([payload])
-                logger.debug(f"on_notify: {payload}")
-                self.count["db"] += 1
+                if self.index in payload["indices"]:
+                    self.redis.bulk_push([payload])
+                    logger.debug(f"on_notify: {payload}")
+                    self.count["db"] += 1
 
     def refresh_views(self) -> None:
         self._refresh_views()
@@ -1057,7 +1137,7 @@ class Sync(Base):
 
         This is triggered by poll_redis.
         It is called when an event is received from Redis.
-        Deserialize the payload from Redis and sync to Elasticsearch.
+        Deserialize the payload from Redis and sync to Elasticsearch/OpenSearch
         """
         # this is used for the views.
         # we substitute the views for the base table here
@@ -1079,7 +1159,7 @@ class Sync(Base):
                 _payloads[payload.table].append(payload)
 
             for _payload in _payloads.values():
-                self.es.bulk(self.index, self._payloads(_payload))
+                self.search_client.bulk(self.index, self._payloads(_payload))
 
         else:
 
@@ -1093,10 +1173,14 @@ class Sync(Base):
                         payload.tg_op != payload2.tg_op
                         or payload.table != payload2.table
                     ):
-                        self.es.bulk(self.index, self._payloads(_payloads))
+                        self.search_client.bulk(
+                            self.index, self._payloads(_payloads)
+                        )
                         _payloads = []
                 elif j == len(payloads):
-                    self.es.bulk(self.index, self._payloads(_payloads))
+                    self.search_client.bulk(
+                        self.index, self._payloads(_payloads)
+                    )
                     _payloads: list = []
 
         txids: Set = set(map(lambda x: x.xmin, payloads))
@@ -1110,7 +1194,9 @@ class Sync(Base):
         txmax: int = self.txid_current
         logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
         # forward pass sync
-        self.es.bulk(self.index, self.sync(txmin=txmin, txmax=txmax))
+        self.search_client.bulk(
+            self.index, self.sync(txmin=txmin, txmax=txmax)
+        )
         # now sync up to txmax to capture everything we may have missed
         self.logical_slot_changes(txmin=txmin, txmax=txmax, upto_nchanges=None)
         self.checkpoint: int = txmax or self.txid_current
@@ -1122,13 +1208,13 @@ class Sync(Base):
         """Truncate the logical replication slot."""
         while True:
             self._truncate_slots()
-            time.sleep(REPLICATION_SLOT_CLEANUP_INTERVAL)
+            time.sleep(settings.REPLICATION_SLOT_CLEANUP_INTERVAL)
 
     @exception
     async def async_truncate_slots(self) -> None:
         while True:
             self._truncate_slots()
-            await asyncio.sleep(REPLICATION_SLOT_CLEANUP_INTERVAL)
+            await asyncio.sleep(settings.REPLICATION_SLOT_CLEANUP_INTERVAL)
 
     def _truncate_slots(self) -> None:
         if self._truncate:
@@ -1140,22 +1226,22 @@ class Sync(Base):
     def status(self) -> None:
         while True:
             self._status(label="Sync")
-            time.sleep(LOG_INTERVAL)
+            time.sleep(settings.LOG_INTERVAL)
 
     @exception
     async def async_status(self) -> None:
         while True:
             self._status(label="Async")
-            await asyncio.sleep(LOG_INTERVAL)
+            await asyncio.sleep(settings.LOG_INTERVAL)
 
     def _status(self, label: str) -> None:
         sys.stdout.write(
-            f"{label} {self.database} "
+            f"{label} {self.database}:{self.index} "
             f"Xlog: [{self.count['xlog']:,}] => "
             f"Db: [{self.count['db']:,}] => "
             f"Redis: [total = {self.count['redis']:,} "
             f"pending = {self.redis.qsize:,}] => "
-            f"Elastic: [{self.es.doc_count:,}] ...\n"
+            f"Search: [{self.search_client.doc_count:,}] ...\n"
         )
         sys.stdout.flush()
 
@@ -1169,7 +1255,7 @@ class Sync(Base):
         2. Pull everything so far and also replay replication logs.
         3. Consume all changes from Redis.
         """
-        if USE_ASYNC:
+        if settings.USE_ASYNC:
             self._conn = self.engine.connect().connection
             self._conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
             cursor = self.conn.cursor()
@@ -1192,7 +1278,7 @@ class Sync(Base):
             # sync up to current transaction_id
             self.pull()
             # start a background worker consumer thread to
-            # poll Redis and populate Elasticsearch
+            # poll Redis and populate Elasticsearch/OpenSearch
             self.poll_redis()
             # start a background worker thread to cleanup the replication slot
             self.truncate_slots()
@@ -1207,7 +1293,21 @@ class Sync(Base):
     help="Schema config",
     type=click.Path(exists=True),
 )
-@click.option("--daemon", "-d", is_flag=True, help="Run as a daemon")
+@click.option(
+    "--daemon",
+    "-d",
+    is_flag=True,
+    help="Run as a daemon (Incompatible with --polling)",
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["polling"],
+)
+@click.option(
+    "--polling",
+    is_flag=True,
+    help="Polling mode (Incompatible with -d)",
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["daemon"],
+)
 @click.option("--host", "-h", help="PG_HOST override")
 @click.option("--password", is_flag=True, help="Prompt for database password")
 @click.option("--port", "-p", help="PG_PORT override", type=int)
@@ -1251,13 +1351,15 @@ class Sync(Base):
     is_flag=True,
     default=False,
     help="Analyse database",
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["daemon", "polling"],
 )
 @click.option(
     "--nthreads_polldb",
     "-n",
     help="Number of threads to spawn for poll db",
     type=int,
-    default=NTHREADS_POLLDB,
+    default=settings.NTHREADS_POLLDB,
 )
 def main(
     config,
@@ -1272,6 +1374,7 @@ def main(
     version,
     analyze,
     nthreads_polldb,
+    polling,
 ):
     """Main application syncer."""
     if version:
@@ -1301,17 +1404,27 @@ def main(
 
     with Timer():
 
-        for document in load_config(config):
-            sync: Sync = Sync(document, verbose=verbose, **kwargs)
+        if analyze:
 
-            if analyze:
+            for document in config_loader(config):
+                sync: Sync = Sync(document, verbose=verbose, **kwargs)
                 sync.analyze()
-                continue
 
-            sync.pull()
+        elif polling:
 
-            if daemon:
-                sync.receive(nthreads_polldb)
+            while True:
+                for document in config_loader(config):
+                    sync: Sync = Sync(document, verbose=verbose, **kwargs)
+                    sync.pull()
+                time.sleep(settings.POLL_INTERVAL)
+
+        else:
+
+            for document in config_loader(config):
+                sync: Sync = Sync(document, verbose=verbose, **kwargs)
+                sync.pull()
+                if daemon:
+                    sync.receive(nthreads_polldb)
 
 
 if __name__ == "__main__":
